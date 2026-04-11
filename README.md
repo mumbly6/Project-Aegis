@@ -1,7 +1,7 @@
 # Project Aegis
 
 > **A production-grade C++20 ECS & Systems Performance Prototype**  
-> Submitted to CppCon as a demonstration of mechanical sympathy and data-oriented design.
+
 
 ---
 
@@ -115,12 +115,6 @@ Combined Frame
 
 ---
 
-## CppCon Submission Narrative
-
-> *"We engineered a lock-free task scheduler backed by thread-local linear memory  
-> pools and a data-oriented entity system to demonstrate that mechanical sympathy  
-> — aligning software structure to hardware reality — yields 10×–20× throughput  
-> improvements over idiomatic OOP without sacrificing type safety or code clarity."*
 
 ---
 
