@@ -1,0 +1,425 @@
+/**
+ * @file   bench_full.cpp
+ * @brief  Project Aegis — Phase 4: Combined CppCon Benchmark Suite
+ *
+ * The authoritative, single-executable comparison across all three axes:
+ *
+ *   ┌──────────────────────────────────────────────────────────────────────┐
+ *   │  AXIS 1 — MEMORY                                                     │
+ *   │  Heap AoS (std::unique_ptr)   vs.  SoA ArenaAllocator               │
+ *   ├──────────────────────────────────────────────────────────────────────┤
+ *   │  AXIS 2 — CONCURRENCY                                                │
+ *   │  std::queue + std::mutex      vs.  aegis::MpmcQueue (lock-free)      │
+ *   ├──────────────────────────────────────────────────────────────────────┤
+ *   │  AXIS 3 — ECS / DATA ACCESS                                          │
+ *   │  Virtual dispatch (AoP)       vs.  SparseSet View (SoA sweep)        │
+ *   ├──────────────────────────────────────────────────────────────────────┤
+ *   │  COMBINED — AEGIS SIMULATED FRAME                                    │
+ *   │  Naive single-threaded OOP    vs.  Aegis (Arena + MPMC + ECS)        │
+ *   └──────────────────────────────────────────────────────────────────────┘
+ *
+ * Run:
+ *   aegis_full_benchmarks.exe --benchmark_format=json \
+ *       --benchmark_out=results.json \
+ *       --benchmark_repetitions=5 \
+ *       --benchmark_report_aggregates_only=true
+ *
+ * Then load results.json into https://codspeed.io or Google Benchmark Compare
+ * to generate the slide-ready chart.
+ */
+
+#include <aegis/aegis.hpp>
+
+#include <benchmark/benchmark.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Shared constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr uint32_t    kEntities  = 1'000'000u;
+static constexpr uint64_t    kQueueOps  = 500'000ull;
+static constexpr std::size_t kRingSize  = 1u << 13;    // 8192 slots
+static constexpr float       kDt        = 0.016f;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ══════════════════════════  AXIS 1: MEMORY  ════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HeapEntity {
+    float x, y, vx, vy;
+    virtual ~HeapEntity() = default;
+    virtual void Tick(float dt) noexcept {
+        x += vx * dt; y += vy * dt;
+        vx = std::sin(x); vy = std::cos(y);
+    }
+};
+
+// ── Baseline ──────────────────────────────────────────────────────────────────
+static void BM_Memory_Baseline(benchmark::State& state)
+{
+    std::vector<std::unique_ptr<HeapEntity>> v;
+    v.reserve(kEntities);
+    for (uint32_t i = 0; i < kEntities; ++i) {
+        auto e = std::make_unique<HeapEntity>();
+        e->x = e->y = static_cast<float>(i) * 0.001f;
+        e->vx = 1.f; e->vy = .5f;
+        v.push_back(std::move(e));
+    }
+    for (auto _ : state) {
+        for (auto& e : v) { e->Tick(kDt); }
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kEntities);
+    state.SetLabel("Heap AoP | virtual | cache miss");
+}
+
+// ── Optimised ─────────────────────────────────────────────────────────────────
+static void BM_Memory_Aegis(benchmark::State& state)
+{
+    aegis::MediumArena arena;
+    for (auto _ : state) {
+        float* xs  = arena.Allocate<float>(kEntities);
+        float* ys  = arena.Allocate<float>(kEntities);
+        float* vxs = arena.Allocate<float>(kEntities);
+        float* vys = arena.Allocate<float>(kEntities);
+        for (uint32_t i = 0; i < kEntities; ++i) {
+            xs[i] = ys[i] = static_cast<float>(i) * 0.001f;
+            vxs[i] = 1.f; vys[i] = .5f;
+        }
+        for (uint32_t i = 0; i < kEntities; ++i) {
+            xs[i]  += vxs[i] * kDt;  ys[i]  += vys[i] * kDt;
+            vxs[i]  = std::sin(xs[i]); vys[i] = std::cos(ys[i]);
+        }
+        benchmark::ClobberMemory();
+        arena.Reset();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kEntities);
+    state.SetLabel("SoA Arena | direct | prefetcher heaven");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ═══════════════════════  AXIS 2: CONCURRENCY  ══════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Baseline ──────────────────────────────────────────────────────────────────
+static void BM_Concurrency_Mutex(benchmark::State& state)
+{
+    const int nT = static_cast<int>(state.range(0));
+    const uint64_t perProd = kQueueOps / static_cast<uint64_t>(nT);
+
+    for (auto _ : state) {
+        std::queue<uint64_t> q;
+        std::mutex           mu;
+        std::atomic<uint64_t> consumed{0};
+        const uint64_t total = perProd * static_cast<uint64_t>(nT);
+
+        std::vector<std::thread> prod, cons;
+        prod.reserve(static_cast<std::size_t>(nT));
+        cons.reserve(static_cast<std::size_t>(nT));
+
+        for (int t = 0; t < nT; ++t)
+            prod.emplace_back([&, t](){
+                uint64_t base = static_cast<uint64_t>(t) * perProd;
+                for (uint64_t i = 0; i < perProd; ++i) {
+                    std::lock_guard<std::mutex> lk(mu);
+                    q.push(base + i);
+                }
+            });
+
+        for (int t = 0; t < nT; ++t)
+            cons.emplace_back([&](){
+                while (consumed.load(std::memory_order_relaxed) < total) {
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (!q.empty()) { benchmark::DoNotOptimize(q.front()); q.pop();
+                        consumed.fetch_add(1, std::memory_order_relaxed); }
+                }
+            });
+
+        for (auto& p : prod) p.join();
+        for (auto& c : cons) c.join();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
+                            static_cast<int64_t>(kQueueOps));
+    state.SetLabel("std::mutex | kernel park | cache thrash");
+}
+
+// ── Optimised ─────────────────────────────────────────────────────────────────
+static void BM_Concurrency_LockFree(benchmark::State& state)
+{
+    const int nT = static_cast<int>(state.range(0));
+    const uint64_t perProd = kQueueOps / static_cast<uint64_t>(nT);
+
+    aegis::MpmcQueue<uint64_t, kRingSize> queue;
+
+    for (auto _ : state) {
+        std::atomic<uint64_t> consumed{0};
+        const uint64_t total = perProd * static_cast<uint64_t>(nT);
+
+        std::vector<std::thread> prod, cons;
+        prod.reserve(static_cast<std::size_t>(nT));
+        cons.reserve(static_cast<std::size_t>(nT));
+
+        for (int t = 0; t < nT; ++t)
+            prod.emplace_back([&, t](){
+                uint64_t base = static_cast<uint64_t>(t) * perProd;
+                for (uint64_t i = 0; i < perProd; ++i) {
+                    uint64_t item = base + i;
+                    while (!queue.TryEnqueue(item)) std::this_thread::yield();
+                }
+            });
+
+        for (int t = 0; t < nT; ++t)
+            cons.emplace_back([&](){
+                uint64_t item;
+                while (consumed.load(std::memory_order_relaxed) < total) {
+                    if (queue.TryDequeue(item)) {
+                        benchmark::DoNotOptimize(item);
+                        consumed.fetch_add(1, std::memory_order_relaxed);
+                    } else std::this_thread::yield();
+                }
+            });
+
+        for (auto& p : prod) p.join();
+        for (auto& c : cons) c.join();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
+                            static_cast<int64_t>(kQueueOps));
+    state.SetLabel("MpmcQueue | CAS only | no kernel");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ═══════════════════════  AXIS 3: ECS / DATA ACCESS  ════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct OopGameObject {
+    float px, py, vx, vy;
+    virtual ~OopGameObject() = default;
+    virtual void Update(float dt) noexcept {
+        px += vx * dt; py += vy * dt;
+        vx = std::sin(px); vy = std::cos(py);
+    }
+};
+struct ConcreteGO final : OopGameObject {
+    void Update(float dt) noexcept override {
+        OopGameObject::Update(dt);
+    }
+};
+
+struct Pos { float x, y; };
+struct Vel { float x, y; };
+
+static aegis::SparseSet<Pos, kEntities> s_pos;
+static aegis::SparseSet<Vel, kEntities> s_vel;
+static bool s_ecs_ready = false;
+
+static void EnsureECS()
+{
+    if (s_ecs_ready) return;
+    aegis::EntityManager<kEntities> mgr;
+    for (uint32_t i = 0; i < kEntities; ++i) {
+        auto e = mgr.Create();
+        uint32_t idx = aegis::detail::GetIndex(e);
+        s_pos.Emplace(idx, Pos{static_cast<float>(i)*0.001f, static_cast<float>(i)*0.002f});
+        s_vel.Emplace(idx, Vel{1.0f, 0.5f});
+    }
+    s_ecs_ready = true;
+}
+
+// ── Baseline ──────────────────────────────────────────────────────────────────
+static void BM_ECS_Baseline(benchmark::State& state)
+{
+    std::vector<std::unique_ptr<OopGameObject>> objs;
+    objs.reserve(kEntities);
+    for (uint32_t i = 0; i < kEntities; ++i) {
+        auto o = std::make_unique<ConcreteGO>();
+        o->px = o->py = static_cast<float>(i) * 0.001f;
+        o->vx = 1.f; o->vy = .5f;
+        objs.push_back(std::move(o));
+    }
+    for (auto _ : state) {
+        for (auto& o : objs) o->Update(kDt);
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kEntities);
+    state.SetLabel("OOP vtable | AoP | virtual dispatch");
+}
+
+// ── Optimised ─────────────────────────────────────────────────────────────────
+static void BM_ECS_Aegis(benchmark::State& state)
+{
+    EnsureECS();
+    auto view = aegis::MakeView(s_pos, s_vel);
+    for (auto _ : state) {
+        for (aegis::Entity e : view) {
+            auto& [pos, vel] = view.Get(e);
+            pos.x += vel.x * kDt; pos.y += vel.y * kDt;
+            vel.x = std::sin(pos.x); vel.y = std::cos(pos.y);
+        }
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kEntities);
+    state.SetLabel("ECS View | SparseSet SoA | linear sweep");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ═══════════════════════  COMBINED AEGIS FRAME  ═════════════════════════════
+//
+//  Simulates one full engine tick using ALL three Aegis subsystems together:
+//    1.  Arena allocator provides scratch memory for per-frame temporaries.
+//    2.  MpmcQueue dispatches "render command" tasks to worker threads.
+//    3.  ECS View sweeps position + velocity components.
+//
+//  vs. a single-threaded OOP pass over heap objects with a mutex-guarded
+//  command queue.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Represents a render draw-call command (64 bytes = one cache line).
+struct alignas(64) RenderCmd {
+    float mvp[16]{};   // model-view-projection matrix placeholder
+    uint32_t entity_id{0};
+    uint32_t _pad[3]{};
+};
+
+// ── Baseline: naive single-threaded with mutex ────────────────────────────────
+static void BM_Frame_Naive(benchmark::State& state)
+{
+    // Objects
+    std::vector<std::unique_ptr<HeapEntity>> world;
+    world.reserve(kEntities);
+    for (uint32_t i = 0; i < kEntities; ++i) {
+        auto e = std::make_unique<HeapEntity>();
+        e->x = e->y = static_cast<float>(i) * 0.001f;
+        e->vx = 1.f; e->vy = .5f;
+        world.push_back(std::move(e));
+    }
+
+    // Command queue (mutex-guarded)
+    std::queue<RenderCmd> cmd_queue;
+    std::mutex            cmd_mu;
+
+    for (auto _ : state) {
+        // Update all entities (virtual dispatch + heap scatter)
+        for (auto& e : world) { e->Tick(kDt); }
+
+        // Enqueue a render command for each entity (lock per push)
+        for (uint32_t i = 0; i < kEntities; ++i) {
+            RenderCmd cmd;
+            cmd.entity_id = i;
+            cmd.mvp[0]    = world[i]->x;
+            cmd.mvp[1]    = world[i]->y;
+            std::lock_guard<std::mutex> lk(cmd_mu);
+            cmd_queue.push(cmd);
+        }
+
+        // Drain (simulate GPU upload)
+        {
+            std::lock_guard<std::mutex> lk(cmd_mu);
+            while (!cmd_queue.empty()) {
+                benchmark::DoNotOptimize(cmd_queue.front());
+                cmd_queue.pop();
+            }
+        }
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kEntities);
+    state.SetLabel("Naive OOP frame | mutex cmds | virtual dispatch");
+}
+
+// ── Optimised: Aegis-powered frame ───────────────────────────────────────────
+static void BM_Frame_Aegis(benchmark::State& state)
+{
+    EnsureECS();
+    auto view = aegis::MakeView(s_pos, s_vel);
+
+    // Per-frame arena scratch (reset each tick)
+    aegis::MediumArena scratch;
+
+    // Lock-free render command queue
+    aegis::MpmcQueue<RenderCmd, kRingSize> cmd_queue;
+
+    // Worker thread drains the command queue in parallel
+    std::atomic<bool> running{true};
+    std::atomic<uint64_t> drained{0};
+    std::thread worker([&](){
+        RenderCmd cmd;
+        while (running.load(std::memory_order_acquire) ||
+               !cmd_queue.EmptyApprox()) {
+            if (cmd_queue.TryDequeue(cmd)) {
+                benchmark::DoNotOptimize(cmd);
+                drained.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    for (auto _ : state) {
+        drained.store(0, std::memory_order_relaxed);
+
+        // 1. Bump-allocate per-frame render command buffer from arena
+        RenderCmd* local_cmds = scratch.Allocate<RenderCmd>(kEntities);
+
+        // 2. ECS View sweep — linear, no vtable, auto-vectorisable
+        uint32_t cmd_idx = 0;
+        for (aegis::Entity e : view) {
+            auto& [pos, vel] = view.Get(e);
+            pos.x += vel.x * kDt; pos.y += vel.y * kDt;
+            vel.x = std::sin(pos.x); vel.y = std::cos(pos.y);
+
+            // Build render command in the arena scratch buffer
+            local_cmds[cmd_idx].entity_id = e;
+            local_cmds[cmd_idx].mvp[0]    = pos.x;
+            local_cmds[cmd_idx].mvp[1]    = pos.y;
+            ++cmd_idx;
+        }
+
+        // 3. Dispatch render commands through the lock-free queue
+        for (uint32_t i = 0; i < cmd_idx; ++i) {
+            while (!cmd_queue.TryEnqueue(local_cmds[i]))
+                std::this_thread::yield();
+        }
+
+        // 4. O(1) frame-end reset — no free(), no OS call
+        scratch.Reset();
+
+        benchmark::ClobberMemory();
+    }
+
+    running.store(false, std::memory_order_release);
+    worker.join();
+
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kEntities);
+    state.SetLabel("Aegis frame | Arena+MPMC+ECS | zero-heap hot path");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Registration
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Axis 1: Memory ────────────────────────────────────────────────────────────
+BENCHMARK(BM_Memory_Baseline)->Unit(benchmark::kMillisecond)->Repetitions(3);
+BENCHMARK(BM_Memory_Aegis)   ->Unit(benchmark::kMillisecond)->Repetitions(3);
+
+// ── Axis 2: Concurrency (1 and 4 thread pairs) ────────────────────────────────
+BENCHMARK(BM_Concurrency_Mutex)   ->Arg(1)->Arg(4)->Unit(benchmark::kMillisecond)->Repetitions(3)->UseRealTime();
+BENCHMARK(BM_Concurrency_LockFree)->Arg(1)->Arg(4)->Unit(benchmark::kMillisecond)->Repetitions(3)->UseRealTime();
+
+// ── Axis 3: ECS ───────────────────────────────────────────────────────────────
+BENCHMARK(BM_ECS_Baseline)->Unit(benchmark::kMillisecond)->Repetitions(3);
+BENCHMARK(BM_ECS_Aegis)   ->Unit(benchmark::kMillisecond)->Repetitions(3);
+
+// ── Combined frame ────────────────────────────────────────────────────────────
+BENCHMARK(BM_Frame_Naive)->Unit(benchmark::kMillisecond)->Repetitions(3);
+BENCHMARK(BM_Frame_Aegis)->Unit(benchmark::kMillisecond)->Repetitions(3);
+
+BENCHMARK_MAIN();

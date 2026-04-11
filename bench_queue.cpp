@@ -1,0 +1,227 @@
+/**
+ * @file   bench_queue.cpp
+ * @brief  Project Aegis — Phase 2 Benchmarks: Lock vs Lock-Free MPMC Queue
+ *
+ * Two throughput comparisons with N producer + N consumer std::threads:
+ *
+ *   BM_Mutex_Queue   — std::queue<uint64_t> protected by std::mutex.
+ *                      Any enqueue or dequeue acquires an exclusive kernel lock.
+ *                      Under contention: threads park, the OS scheduler runs,
+ *                      cache lines bounce across cores → massive latency jitter.
+ *
+ *   BM_LockFree_Queue — aegis::MpmcQueue<uint64_t, kRingSize>.
+ *                        Producers and consumers spin on a CAS loop using only
+ *                        acquire/release fences.  No kernel involvement.
+ *
+ * Measurement methodology:
+ *   Each iteration enqueues and dequeues kOpCount items across all threads.
+ *   We report "items/second" via SetItemsProcessed so that results are
+ *   immediately comparable regardless of kOpCount or thread count.
+ *
+ * Run with:
+ *   aegis_queue_benchmarks.exe --benchmark_repetitions=3 \
+ *       --benchmark_report_aggregates_only=true
+ */
+
+#include <aegis/mpmc_queue.hpp>
+
+#include <benchmark/benchmark.h>
+
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Total items moved through the queue per benchmark iteration.
+static constexpr uint64_t kOpCount  = 1'000'000ull;
+
+/// Ring buffer size for MpmcQueue.  Must be power-of-two and >> producer count
+/// to avoid producers spinning on a full queue in the steady state.
+static constexpr std::size_t kRingSize = 1u << 14;   // 16 384 slots
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Baseline: std::queue + std::mutex
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Benchmark: locked MPMC queue.
+ *
+ * state.range(0) = number of producer threads == number of consumer threads.
+ *
+ * Pathology exposed:
+ *   - Every lock() is a potential kernel transition under contention.
+ *   - The std::queue node allocates from the heap (std::deque) — pointer chasing.
+ *   - The mutex cache line bounces between all producer/consumer cores.
+ */
+static void BM_Mutex_Queue(benchmark::State& state)
+{
+    const int nThreads = static_cast<int>(state.range(0));
+    const uint64_t itemsPerProducer = kOpCount / static_cast<uint64_t>(nThreads);
+
+    for (auto _ : state) {
+        std::queue<uint64_t> q;
+        std::mutex           mtx;
+        std::atomic<uint64_t> consumed{0};
+
+        // ── Producer threads ─────────────────────────────────────────────────
+        std::vector<std::thread> producers;
+        producers.reserve(static_cast<std::size_t>(nThreads));
+        for (int t = 0; t < nThreads; ++t) {
+            producers.emplace_back([&, t]() {
+                const uint64_t base = static_cast<uint64_t>(t) * itemsPerProducer;
+                for (uint64_t i = 0; i < itemsPerProducer; ++i) {
+                    std::lock_guard<std::mutex> lk(mtx);   // LOCK — kernel path
+                    q.push(base + i);
+                }
+            });
+        }
+
+        // ── Consumer threads ─────────────────────────────────────────────────
+        const uint64_t total  = itemsPerProducer * static_cast<uint64_t>(nThreads);
+        std::vector<std::thread> consumers;
+        consumers.reserve(static_cast<std::size_t>(nThreads));
+        for (int t = 0; t < nThreads; ++t) {
+            consumers.emplace_back([&]() {
+                while (consumed.load(std::memory_order_relaxed) < total) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (!q.empty()) {
+                        benchmark::DoNotOptimize(q.front());
+                        q.pop();
+                        consumed.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+
+        for (auto& p : producers) p.join();
+        for (auto& c : consumers) c.join();
+    }
+
+    state.SetItemsProcessed(
+        static_cast<int64_t>(state.iterations()) *
+        static_cast<int64_t>(kOpCount));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Optimised: aegis::MpmcQueue — lock-free, CAS-only
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Benchmark: lock-free MPMC ring buffer.
+ *
+ * state.range(0) = number of producer threads == number of consumer threads.
+ *
+ * Why it wins:
+ *   - TryEnqueue / TryDequeue touch exactly two cache lines: the Slot and tail_/head_.
+ *   - No kernel calls.  Threads spin using CPU instructions only.
+ *   - Under x86-64, acquire/release = zero extra fences (TSO model gives them for free).
+ *   - The ring buffer is stack-allocated — no heap fragmentation.
+ */
+static void BM_LockFree_Queue(benchmark::State& state)
+{
+    const int nThreads = static_cast<int>(state.range(0));
+    const uint64_t itemsPerProducer = kOpCount / static_cast<uint64_t>(nThreads);
+
+    // The queue lives outside the timing loop so we benchmark steady-state
+    // throughput, not construction cost.
+    aegis::MpmcQueue<uint64_t, kRingSize> queue;
+
+    for (auto _ : state) {
+        std::atomic<uint64_t> consumed{0};
+        const uint64_t total = itemsPerProducer * static_cast<uint64_t>(nThreads);
+
+        // ── Producer threads ─────────────────────────────────────────────────
+        std::vector<std::thread> producers;
+        producers.reserve(static_cast<std::size_t>(nThreads));
+        for (int t = 0; t < nThreads; ++t) {
+            producers.emplace_back([&, t]() {
+                const uint64_t base = static_cast<uint64_t>(t) * itemsPerProducer;
+                for (uint64_t i = 0; i < itemsPerProducer; ++i) {
+                    uint64_t item = base + i;
+                    while (!queue.TryEnqueue(item)) {
+                        // Queue full; yield to give consumers a chance.
+                        // In a real task scheduler this would be a
+                        // std::this_thread::yield() or futex_wait.
+                        std::this_thread::yield();
+                    }
+                }
+            });
+        }
+
+        // ── Consumer threads ─────────────────────────────────────────────────
+        std::vector<std::thread> consumers;
+        consumers.reserve(static_cast<std::size_t>(nThreads));
+        for (int t = 0; t < nThreads; ++t) {
+            consumers.emplace_back([&]() {
+                uint64_t item;
+                while (consumed.load(std::memory_order_relaxed) < total) {
+                    if (queue.TryDequeue(item)) {
+                        benchmark::DoNotOptimize(item);
+                        consumed.fetch_add(1u, std::memory_order_relaxed);
+                    } else {
+                        std::this_thread::yield();
+                    }
+                }
+            });
+        }
+
+        for (auto& p : producers) p.join();
+        for (auto& c : consumers) c.join();
+    }
+
+    state.SetItemsProcessed(
+        static_cast<int64_t>(state.iterations()) *
+        static_cast<int64_t>(kOpCount));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bonus: raw TryEnqueue + TryDequeue throughput on a single thread
+//  Measures the pure CAS cost without thread scheduling noise.
+// ─────────────────────────────────────────────────────────────────────────────
+static void BM_LockFree_SingleThread(benchmark::State& state)
+{
+    aegis::MpmcQueue<uint64_t, kRingSize> queue;
+    uint64_t item;
+
+    for (auto _ : state) {
+        for (uint64_t i = 0; i < kOpCount; ++i) {
+            // This fills and drains the queue in lock-step: always 1 item in flight.
+            while (!queue.TryEnqueue(i))    {}
+            while (!queue.TryDequeue(item)) {}
+        }
+        benchmark::DoNotOptimize(item);
+    }
+
+    state.SetItemsProcessed(
+        static_cast<int64_t>(state.iterations()) *
+        static_cast<int64_t>(kOpCount));
+    state.SetLabel("lock-free single-thread round-trip");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Registration — range(1, 4) spawns 1, 2, and 4 producer+consumer pairs
+// ─────────────────────────────────────────────────────────────────────────────
+
+BENCHMARK(BM_Mutex_Queue)
+    ->RangeMultiplier(2)->Range(1, 4)
+    ->Unit(benchmark::kMillisecond)
+    ->Repetitions(3)
+    ->UseRealTime();
+
+BENCHMARK(BM_LockFree_Queue)
+    ->RangeMultiplier(2)->Range(1, 4)
+    ->Unit(benchmark::kMillisecond)
+    ->Repetitions(3)
+    ->UseRealTime();
+
+BENCHMARK(BM_LockFree_SingleThread)
+    ->Unit(benchmark::kMillisecond)
+    ->Repetitions(3);
+
+BENCHMARK_MAIN();
