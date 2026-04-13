@@ -1,13 +1,3 @@
-/**
- * @file   aegis.hpp
- * @brief  Project Aegis — Umbrella Include
- *
- * Single header that pulls in all Aegis subsystems.
- * Include this in application code and benchmarks that need everything.
- *
- *   #include <aegis/aegis.hpp>
- */
-
 #pragma once
 
 // Phase 1 — Memory Foundation
