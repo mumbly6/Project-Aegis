@@ -14,11 +14,6 @@
  *   BM_DOD_ArenaSOA — Two contiguous float arrays (x[], y[]) bumped from an
  *                     ArenaAllocator.  CPU prefetcher loads data linearly;
  *                     zero heap calls after arena setup.
- *
- * How to read the results:
- *   "cpu_time" is more reliable than "real_time" for single-machine benchmarks.
- *   Run with --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
- *   for statistical confidence.
  */
 
 #include <aegis/arena_allocator.hpp>
