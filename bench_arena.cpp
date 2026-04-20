@@ -1,5 +1,5 @@
 /**
- * @file   bench_arena.cpp
+ * @file   bench_arena.
  * @brief  Project Aegis — Phase 1 Benchmarks
  *
  * Proves the cache-locality and zero-allocation advantages of Data-Oriented
@@ -151,15 +151,7 @@ static void BM_DOD_ArenaSOA(benchmark::State& state)
         //   • No virtual dispatch or indirect calls.
         for (std::size_t i = 0; i < kEntityCount; ++i) {
             xs[i]  += vxs[i] * kDt;
-            ys[i]  += vys[i] * kDt;
-            vxs[i]  = std::sin(xs[i]);
-            vys[i]  = std::cos(ys[i]);
-        }
-
-        benchmark::ClobberMemory();
-
-        // O(1) "free" — just move the cursor back to zero.
-        arena.Reset();
+            ys[i]  += vys[i] * k
     }
 
     state.SetItemsProcessed(
