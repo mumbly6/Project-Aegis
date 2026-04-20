@@ -1,5 +1,7 @@
 /**
- * @file   bench_queue.cpp
+ * @file   bench_queue.c
+ 
+ 
  * @brief  Project Aegis — Phase 2 Benchmarks: Lock vs Lock-Free MPMC Queue
  *
  * Two throughput comparisons with N producer + N consumer std::threads:
