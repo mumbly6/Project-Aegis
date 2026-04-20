@@ -7,10 +7,7 @@
  *   Bits [31..8]  — Index (24 bits → up to 16,777,216 live entities)
  *   Bits [7..0]   — Generation (8 bits → detects stale handles after Destroy)
  *
- * The generation trick is the canary for dangling entity references:
- *   If code holds Entity e, calls Destroy(e), then Create() reuses the same
- *   index, the new entity has generation+1.  IsAlive(e) returns false for
- *   the old handle immediately — no dangling pointer, no UB.
+ * The generation 
  *
  * Memory:
  *   No heap.  Entity slots are a fixed C-array.  A freelist (intrusive singly-
