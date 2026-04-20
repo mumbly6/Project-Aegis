@@ -8,7 +8,7 @@
  *
  *   • O(1) Has / Get / Emplace / Remove  (amortised, no hash, no tree)
  *   • Contiguous dense array             — cache-friendly linear iteration
- *   • Stable iteration order             — no rehashing, no bucket traversal
+ *   • Stable iteration 
  *
  * Memory layout:
  *   sparse_[entity_id]  → index into dense_   (uint32_t, page-allocated)
@@ -26,12 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <utility>
-
-namespace aegis {
-
-// Sentinel: a sparse entry that points to "no slot".
-inline constexpr uint32_t kNullIndex = std::numeric_limits<uint32_t>::max();
+#include <utility 
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SparseSet<T, PageSize>
