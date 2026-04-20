@@ -1,5 +1,5 @@
 /**
- * @file   bench_ecs.cpp
+ * @file   bench_ecs.
  * @brief  Project Aegis — Phase 3 Benchmarks: OOP virtual dispatch vs ECS SparseSet View
  *
  * Scenario: 1,000,000 entities each having a 2-D position and velocity.
@@ -37,8 +37,7 @@ static constexpr uint32_t    kEntityCount = 1'000'000u;
 static constexpr uint32_t    kCapacity    = kEntityCount;
 static constexpr float       kDt          = 0.016f;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Component types (plain aggregates — no vtable, no heap)
+// ────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Position { float x, y; };
