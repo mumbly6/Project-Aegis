@@ -2,8 +2,7 @@
  * @file   view.hpp
  * @brief  Project Aegis — Phase 3: Variadic Component View
  *
- * View<C0, C1, ...> provides a zero-overhead iterator over all entities
- * that simultaneously possess components C0, C1, ....
+ * .
  *
  * Algorithm:
  *   1. Identify the SparseSet with the fewest elements (the "leading" set).
