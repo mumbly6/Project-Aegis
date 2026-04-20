@@ -1,6 +1,6 @@
 /**
- * @file   bench_full.cpp
- * @brief  Project Aegis — Phase 4: Combined CppCon Benchmark Suite
+ * @file   bench_full
+ * @brief  Project Aegis — 
  *
  * The authoritative, single-executable comparison across all three axes:
  *
